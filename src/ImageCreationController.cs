@@ -21,17 +21,19 @@ namespace ImageCreatorWebAPI
         {
             _imageCreationService = imageCreationService;
         }
-        
+
         /// <summary>
         /// When sending a <see cref="DataContainer"/> you'll receive the image preview
         /// </summary>
-        /// <param name="dataContainer"></param>
+        /// <param name="dataContainer">The container to create the image for</param>
+        /// <param name="width">[Optional] Image width, default 600</param>
+        /// <param name="height">[Optional] Image height, default 315</param>
         /// <returns></returns>
         [HttpPost]
         [Route("")]
-        public async Task<IActionResult> PostDataContainer([FromBody]DataContainer dataContainer)
+        public async Task<IActionResult> PostDataContainer([FromBody]DataContainer dataContainer, [FromQuery]int? width, [FromQuery]int? height)
         {
-            var imageData = await _imageCreationService.Create(dataContainer, 600, 315);
+            var imageData = await _imageCreationService.Create(dataContainer, width ?? 600, height ?? 315);
             return new FileContentResult(imageData, new MediaTypeHeaderValue("image/png"));
         }
     }
