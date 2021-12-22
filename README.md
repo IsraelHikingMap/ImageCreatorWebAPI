@@ -13,4 +13,28 @@ Or build it from sources:
 ```
 cd src
 docker build . -t imagecreatorwebapi
+docker run -p 12345:80 imagecreatorwebapi
+```
+
+Now surf to localhost:12345/swagger/ to get a simple UI to interact with the elevation service
+Example of the most simple object to be sent in the post request:
+```json
+{
+  "routes": [
+  ],
+  "northEast": {
+    "lat": 32.5,
+    "lng": 35.5,
+    "alt": 0
+  },
+  "southWest": {
+    "lat": 32,
+    "lng": 35,
+    "alt": 0
+  },
+  "baseLayer": { "key": "IHM", "address": "" },
+  "overlays": [
+    
+  ]
+}
 ```
