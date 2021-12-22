@@ -1,0 +1,497 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Net.Http;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+using SixLabors.ImageSharp;
+using SixLabors.ImageSharp.Drawing;
+using SixLabors.ImageSharp.Drawing.Processing;
+using SixLabors.ImageSharp.PixelFormats;
+using SixLabors.ImageSharp.Processing;
+
+namespace ImageCreatorWebAPI
+{
+    internal class ImageCreationContext
+    {
+        public Image Image { get; set; }
+        public Point TopLeft { get; set; }
+        public Point BottomRight { get; set; }
+        public int Width { get; set; }
+        public int Height { get; set; }
+        public int Zoom { get; set; }
+        public double N { get; set; }
+        public DataContainer DataContainer { get; set; }
+        public AddressAndOpacity[] AddressesTemplates { get; set; }
+    }
+
+    internal class ImageWithOffset
+    {
+        public Image Image { get; set; }
+        public Point Offset { get; set; }
+    }
+
+    internal class AddressAndOpacity
+    {
+        public string Address { get; set; }
+        public double Opacity { get; set; }
+    }
+    
+    /// <summary>
+    /// A service to create images
+    /// </summary>
+    public class ImageCreationService
+    {
+        private const int TILE_SIZE = 256; // pixels
+        private const int PEN_WIDTH_OFFSET = 8; // pixels
+        private const float CIRCLE_RADIUS = 12; // pixels
+        private const float PEN_WIDTH = 13; // pixels
+        private const float CIRCLE_OUTLINE_WIDTH = 7; // pixels
+        private const int MAX_ZOOM = 16;
+
+        private readonly IHttpClientFactory _httpClientFactory;
+        private readonly ILogger<ImageCreationService> _logger;
+        private readonly Color[] _routeColors;
+
+        /// <summary>
+        /// Constructor, creates relevant colors and brushes
+        /// </summary>
+        public ImageCreationService(IHttpClientFactory httpClientFactory, ILogger<ImageCreationService> logger)
+        {
+            _logger = logger;
+            _httpClientFactory = httpClientFactory;
+            _routeColors = new List<string>
+            {
+                "#0000FF", // blue
+                "#FF0000", // red
+                "#FF6600", // orange
+                "#FF00DD", // pink
+                "#008000", // green
+                "#B700FF", // purple
+                "#00B0A4", // turquoise
+                "#FFFF00", // yellow
+                "#9C3E00", // brown
+                "#00FFFF", // cyan
+                "#7F8282", // gray
+                "#101010", // dark
+            }.Select(c => FromColorString(c)).ToArray();
+        }
+
+        ///<inheritdoc />
+        public async Task<byte[]> Create(DataContainer dataContainer, int width, int height)
+        {
+            var context = new ImageCreationContext
+            {
+                Width = width,
+                Height = height,
+                DataContainer = dataContainer
+            };
+            UpdateCorners(context);
+            UpdateZoom(context);
+            UpdateAddressesTemplates(context);
+            await UpdateBackGroundImage(context);
+            DrawRoutesOnImage(context);
+            CropAndResizeImage(context);
+            var imageStream = new MemoryStream();
+            context.Image.SaveAsPng(imageStream);
+            return imageStream.ToArray();
+        }
+
+        /// <summary>
+        /// Updates the corners of the data-container to fix the relevant image ratio
+        /// It will increase the height or width of the container as needed.
+        /// </summary>
+        /// <param name="context"></param>
+        private void UpdateCorners(ImageCreationContext context)
+        {
+            if (context.DataContainer.NorthEast == null || context.DataContainer.SouthWest == null)
+            {
+                var allLocations = context.DataContainer.Routes
+                    .SelectMany(r => r.Segments)
+                    .SelectMany(s => s.Latlngs)
+                    .Concat(context.DataContainer.Routes
+                        .SelectMany(r => r.Markers)
+                        .Select(m => m.Latlng)
+                    )
+                    .ToArray();
+                context.DataContainer.NorthEast = new LatLng(allLocations.Max(l => l.Lat), allLocations.Max(l => l.Lng));
+                context.DataContainer.SouthWest = new LatLng(allLocations.Min(l => l.Lat), allLocations.Min(l => l.Lng));
+            }
+            var n = Math.Pow(2, MAX_ZOOM);
+            var xNorthEast = GetXTile(context.DataContainer.NorthEast.Lng, n);
+            var yNorthEast = GetYTile(context.DataContainer.NorthEast.Lat, n);
+            var xSouthWest = GetXTile(context.DataContainer.SouthWest.Lng, n);
+            var ySouthWest = GetYTile(context.DataContainer.SouthWest.Lat, n);
+            var ratio = context.Width * 1.0 / context.Height;
+            if (xNorthEast - xSouthWest > ratio * (ySouthWest - yNorthEast))
+            {
+                var desiredY = (xNorthEast - xSouthWest) / ratio;
+                var deltaY = (desiredY - (ySouthWest - yNorthEast)) / 2;
+                ySouthWest += deltaY;
+                yNorthEast -= deltaY;
+            }
+            else
+            {
+                var desiredX = (ySouthWest - yNorthEast) * ratio;
+                var deltaX = (desiredX - (xNorthEast - xSouthWest)) / 2;
+                xNorthEast += deltaX;
+                xSouthWest -= deltaX;
+            }
+
+            context.DataContainer.NorthEast.Lng = GetLongitude(xNorthEast, n);
+            context.DataContainer.NorthEast.Lat = GetLatitude(yNorthEast, n);
+            context.DataContainer.SouthWest.Lng = GetLongitude(xSouthWest, n);
+            context.DataContainer.SouthWest.Lat = GetLatitude(ySouthWest, n);
+        }
+
+        /// <summary>
+        /// Updates the zoom that will have tiles that have more pixels than the image needs
+        /// This will make sure the image size will be bigger than the desired image to improve quality
+        /// </summary>
+        /// <param name="context"></param>
+        private void UpdateZoom(ImageCreationContext context)
+        {
+            var zoom = 0;
+            double n;
+            double deltaX;
+            double deltaY;
+            do
+            {
+                zoom++;
+                n = Math.Pow(2, zoom);
+                deltaX = GetXTile(context.DataContainer.NorthEast.Lng, n) - GetXTile(context.DataContainer.SouthWest.Lng, n);
+                deltaY = GetYTile(context.DataContainer.SouthWest.Lat, n) - GetYTile(context.DataContainer.NorthEast.Lat, n);
+                deltaX *= TILE_SIZE;
+                deltaY *= TILE_SIZE;
+            } while (deltaX < context.Width && deltaY < context.Height);
+            context.Zoom = zoom;
+            context.N = n;
+        }
+
+        /// <summary>
+        /// This will update the address templates and remove empty addresses
+        /// </summary>
+        /// <param name="context"></param>
+        private void UpdateAddressesTemplates(ImageCreationContext context)
+        {
+            var address = IsValidAddress(context.DataContainer.BaseLayer.Address)
+                ? context.DataContainer.BaseLayer.Address
+                : GetBaseAddressFromInvalidString(context.DataContainer.BaseLayer.Address);
+
+            var addressTemplates = new List<AddressAndOpacity>
+            {
+                new AddressAndOpacity { Address = FixAddressTemplate(address), Opacity = context.DataContainer.BaseLayer.Opacity ?? 1.0 }
+            };
+            foreach (var layerData in context.DataContainer.Overlays ?? new List<LayerData>())
+            {
+                if (IsValidAddress(layerData.Address) == false)
+                {
+                    continue;
+                }
+                var addressAndOpacity = new AddressAndOpacity
+                {
+                    Address = FixAddressTemplate(layerData.Address),
+                    Opacity = layerData.Opacity ?? 1.0
+                };
+                addressTemplates.Add(addressAndOpacity);
+            }
+            context.AddressesTemplates = addressTemplates.ToArray();
+        }
+
+        private bool IsValidAddress(string address)
+        {
+            return !string.IsNullOrWhiteSpace(address) && address.Contains("{x}");
+        }
+
+        private string GetBaseAddressFromInvalidString(string address)
+        {
+            if (string.IsNullOrWhiteSpace(address))
+            {
+                return "https://israelhiking.osm.org.il/Hebrew/Tiles/{z}/{x}/{y}.png";
+            }
+            if (address.EndsWith(".json") && address.Contains("ilMTB"))
+            {
+                return "https://israelhiking.osm.org.il/Hebrew/mtbTiles/{z}/{x}/{y}.png";
+            }
+            return "https://israelhiking.osm.org.il/Hebrew/Tiles/{z}/{x}/{y}.png";
+        }
+
+        /// <summary>
+        /// This will update the background image - which is the image created from the base layer and the overlay tiles
+        /// </summary>
+        /// <param name="context"></param>
+        /// <returns></returns>
+        private async Task UpdateBackGroundImage(ImageCreationContext context)
+        {
+            var topLeft = new Point((int)GetXTile(context.DataContainer.SouthWest.Lng, context.N), (int)GetYTile(context.DataContainer.NorthEast.Lat, context.N));
+            var bottomRight = new Point((int)GetXTile(context.DataContainer.NorthEast.Lng, context.N), (int)GetYTile(context.DataContainer.SouthWest.Lat, context.N));
+            context.TopLeft = topLeft;
+            context.BottomRight = bottomRight;
+            context.Image = await CreateSingleImageFromTiles(context);
+        }
+
+        /// <summary>
+        /// Will create a single image from all the tiles - this image will include the required image inside
+        /// </summary>
+        /// <param name="context"></param>
+        /// <returns></returns>
+        private async Task<Image> CreateSingleImageFromTiles(ImageCreationContext context)
+        {
+            var horizontalTiles = context.BottomRight.X - context.TopLeft.X + 1;
+            var verticalTiles = context.BottomRight.Y - context.TopLeft.Y + 1;
+            var tasks = new List<Task<ImageWithOffset>>();
+            foreach (var addressTemplate in context.AddressesTemplates)
+            {
+                for (int x = 0; x < horizontalTiles; x++)
+                {
+                    for (int y = 0; y < verticalTiles; y++)
+                    {
+                        var task = GetTileImage(context.TopLeft, new Point(x, y), context.Zoom, addressTemplate);
+                        tasks.Add(task);
+                    }
+                }
+            }
+
+            var imagesWithOffsets = await Task.WhenAll(tasks);
+            var image = new Image<Rgba32>(horizontalTiles * TILE_SIZE, verticalTiles * TILE_SIZE);
+            foreach (var imageWithOffset in imagesWithOffsets)
+            {
+                image.Mutate(x => x.DrawImage(imageWithOffset.Image,
+                    new Point(imageWithOffset.Offset.X * TILE_SIZE, imageWithOffset.Offset.Y * TILE_SIZE), 
+                    1.0f));
+            }
+            return image;
+        }
+
+        private static string FixAddressTemplate(string addressTemplate)
+        {
+            addressTemplate = addressTemplate.Trim();
+            var lowerAddress = addressTemplate.ToLower();
+            if (lowerAddress.StartsWith("http") == false && lowerAddress.StartsWith("www") == false)
+            {
+                return "https://israelhiking.osm.org.il" + lowerAddress;
+            }
+            return addressTemplate;
+        }
+
+        /// <summary>
+        /// This will draw on the background image the route and markers according to color and opacity
+        /// </summary>
+        /// <param name="context"></param>
+        private void DrawRoutesOnImage(ImageCreationContext context)
+        {
+            context.Image.Mutate(ctx =>
+            {
+                var routeColorIndex = 0;
+                foreach (var route in context.DataContainer.Routes)
+                {
+                    var points = route.Segments.SelectMany(s => s.Latlngs)
+                        .Select(l => ConvertLatLngToPoint(l, context))
+                        .Where(p => p.X >= 11 && p.X <= context.Image.Width - 11 && p.Y >= 11 && p.Y <= context.Image.Height - 11)
+                        .ToArray();
+                    var markerPoints = route.Markers.Select(m => ConvertLatLngToPoint(m.Latlng, context));
+                    var lineColor = _routeColors[routeColorIndex++];
+                    routeColorIndex %= _routeColors.Length;
+                    if (!string.IsNullOrEmpty(route.Color))
+                    {
+                        lineColor = FromColorString(route.Color, route.Opacity);
+                    }
+
+                    if (points.Any())
+                    {
+                        var path = new SixLabors.ImageSharp.Drawing.Path(new LinearLineSegment(points));
+                        ctx.Draw(Color.White, PEN_WIDTH + PEN_WIDTH_OFFSET, path);
+                        ctx.Draw(lineColor, PEN_WIDTH, path);
+                        var startCircle = new EllipsePolygon(points.First(), CIRCLE_RADIUS);
+                        ctx.Fill(Color.White, startCircle);
+                        ctx.Draw(Color.Green, CIRCLE_OUTLINE_WIDTH, startCircle);
+                        var endCircle = new EllipsePolygon(points.Last(), CIRCLE_RADIUS);
+                        ctx.Fill(Color.White, endCircle);
+                        ctx.Draw(Color.Red, CIRCLE_OUTLINE_WIDTH, endCircle);
+                    }
+        
+                    foreach (var markerPoint in markerPoints)
+                    {
+                        var markerEllipse = new EllipsePolygon(markerPoint, CIRCLE_RADIUS);
+                        ctx.Fill(Color.White, markerEllipse);
+                        ctx.Draw(lineColor, PEN_WIDTH, markerEllipse);
+                    }
+                }
+            });
+        }
+
+        #region Coordinates Conversion
+        private double GetXTile(double longitude, double n)
+        {
+            return n * ((longitude + 180.0) / 360.0);
+        }
+
+        private double GetYTile(double latitude, double n)
+        {
+            var latitudeInRadians = latitude * Math.PI / 180.0;
+            return (n / 2) * (1 - Math.Log(Math.Tan(latitudeInRadians) + 1.0 / Math.Cos(latitudeInRadians)) / Math.PI);
+        }
+
+        private double GetLongitude(double xTile, double n)
+        {
+            return xTile / n * 360.0 - 180.0;
+        }
+
+        private double GetLatitude(double yTile, double n)
+        {
+            var latitudeInRadians = Math.Atan(Math.Sinh(Math.PI * (1 - 2 * yTile / n)));
+            return latitudeInRadians * 180.0 / Math.PI;
+        }
+        #endregion
+
+        /// <summary>
+        /// This method will fetch the relevant image
+        /// If the required zoom is too big it will fetch and image from a lower zoom and split the relevant part of it
+        /// This allow the other parts of the algorithm to be ignorant to the max zoom.
+        /// </summary>
+        /// <param name="topLeft">Top left corner</param>
+        /// <param name="offset">Offset from corner</param>
+        /// <param name="zoom">required zoom level</param>
+        /// <param name="addressTemplate">The address template to fetch the file from</param>
+        /// <returns></returns>
+        private async Task<ImageWithOffset> GetTileImage(Point topLeft, Point offset, int zoom, AddressAndOpacity addressTemplate)
+        {
+            var xY = new Point(topLeft.X + offset.X, topLeft.Y + offset.Y);
+            var translatedXy = xY;
+            var zoomDifference = Math.Pow(2, zoom - MAX_ZOOM);
+            if (zoomDifference > 1)
+            {
+                // zoom is above max native zoom
+                zoom = MAX_ZOOM;
+                translatedXy = new Point
+                {
+                    X = (int)(xY.X / zoomDifference),
+                    Y = (int)(xY.Y / zoomDifference),
+                };
+            }
+            var file = addressTemplate.Address.Replace("{z}", "{zoom}")
+                        .Replace("{zoom}", zoom.ToString())
+                        .Replace("{x}", translatedXy.X.ToString())
+                        .Replace("{y}", translatedXy.Y.ToString());
+            var content = await GetFileContent(file);
+            if (!content.Any())
+            {
+                return new ImageWithOffset
+                {
+                    Image = new Image<Rgba32>(TILE_SIZE, TILE_SIZE),
+                    Offset = offset
+                };
+            }
+            var image = Image.Load(content);
+            if (addressTemplate.Opacity < 1.0)
+            {
+                image.Mutate(x => x.Opacity((float)addressTemplate.Opacity));
+            }
+            if (zoomDifference > 1)
+            {
+                MagnifyImagePart(image, zoomDifference, xY, translatedXy);
+            }
+            return new ImageWithOffset
+            {
+                Image = image,
+                Offset = offset
+            };
+        }
+
+        /// <summary>
+        /// Allows conversion between the image pixels and wgs84 coordinates
+        /// </summary>
+        /// <param name="latLng"></param>
+        /// <param name="context"></param>
+        /// <returns></returns>
+        private PointF ConvertLatLngToPoint(LatLng latLng, ImageCreationContext context)
+        {
+            var x = (float)((GetXTile(latLng.Lng, context.N) - context.TopLeft.X) * TILE_SIZE);
+            var y = (float)((GetYTile(latLng.Lat, context.N) - context.TopLeft.Y) * TILE_SIZE);
+            return new PointF(x, y);
+        }
+
+        /// <summary>
+        /// Utility method to overcome .net core issues with color.
+        /// </summary>
+        /// <param name="colorString"></param>
+        /// <param name="opacity"></param>
+        /// <returns></returns>
+        private Color FromColorString(string colorString, double? opacity = null)
+        {
+            Color color = Color.Blue;
+            if (colorString.StartsWith("#"))
+            {
+                color = Rgba32.ParseHex(colorString);
+            } 
+            else
+            {
+                foreach (var currentColor in Color.WebSafePalette.ToArray())
+                {
+                    if (currentColor.ToString().Equals(colorString, StringComparison.InvariantCultureIgnoreCase))
+                    {
+                        color = currentColor;
+                        break;
+                    }
+                }
+
+            }
+            if (color.ToPixel<Rgba32>().A == 255 && opacity.HasValue)
+            {
+                var pixelColor = color.ToPixel<Rgba32>();
+                color = Color.FromRgba(pixelColor.R, pixelColor.G, pixelColor.B, (byte)(opacity * 255));
+            }
+            return color;
+        }
+
+        /// <summary>
+        /// This takes the relevant image part and convert it to a full size tile
+        /// </summary>
+        /// <param name="image"></param>
+        /// <param name="zoomDifference"></param>
+        /// <param name="xY"></param>
+        /// <param name="translatedXy"></param>
+        /// <returns></returns>
+        private void MagnifyImagePart(Image image, double zoomDifference, Point xY, Point translatedXy)
+        {
+            var x = xY.X / zoomDifference - translatedXy.X;
+            var y = xY.Y / zoomDifference - translatedXy.Y;
+            image.Mutate(ctx => ctx.Crop(new Rectangle((int)(x * image.Width), (int)(y * image.Height), (int)(image.Width / zoomDifference), (int)(image.Height / zoomDifference)))
+                .Resize(TILE_SIZE, TILE_SIZE)
+            );
+        }
+
+        /// <summary>
+        /// Crop and resizes the image to the desired dimensions
+        /// </summary>
+        /// <param name="context"></param>
+        private void CropAndResizeImage(ImageCreationContext context)
+        {
+            var topLeft = ConvertLatLngToPoint(context.DataContainer.SouthWest, context);
+            var bottomRight = ConvertLatLngToPoint(context.DataContainer.NorthEast, context);
+            context.Image.Mutate(x =>
+                x.Crop(new Rectangle((int)topLeft.X, (int)bottomRight.Y, (int)(bottomRight.X - topLeft.X), (int)(topLeft.Y - bottomRight.Y)))
+                .Resize(context.Width, context.Height)
+            );
+        }
+
+        private async Task<byte[]> GetFileContent(string url)
+        {
+            var client = _httpClientFactory.CreateClient();
+            client.Timeout = TimeSpan.FromMinutes(1);
+            var response = await client.GetAsync(url);
+            var content = Array.Empty<byte>();
+            if (response.IsSuccessStatusCode)
+            {
+                content = await response.Content.ReadAsByteArrayAsync();
+            }
+            else
+            {
+                _logger.LogError("Unable to retrieve file from: " + url + ", Status code: " + response.StatusCode);
+            }
+
+            return content;
+        }
+    }
+}
