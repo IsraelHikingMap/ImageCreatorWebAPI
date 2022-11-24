@@ -11,7 +11,6 @@ It can also receive the required width and height of the image.
 Try it out on dockerhub: `israelhikingmap/imagecreatorwebapi`
 Or build it from sources:
 ```
-cd src
 docker build . -t imagecreatorwebapi
 docker run -p 12345:80 imagecreatorwebapi
 ```
